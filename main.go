@@ -233,6 +233,8 @@ func resizePersistentDisk(volume mountedGCEVolume) error {
 	}
 
 	for op.Status != "DONE" || op.Error != nil {
+		time.Sleep(30 * time.Second)
+
 		op, err = zoneOperationsService.Get(projectID, volume.GCPZone, op.Name).Do()
 		if err != nil {
 			return err
