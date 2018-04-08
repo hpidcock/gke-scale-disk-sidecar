@@ -118,7 +118,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if uri.Scheme != "gcp" {
+	if uri.Scheme != "gce" {
 		log.Fatal("pod running on a non-GKE node")
 	}
 
