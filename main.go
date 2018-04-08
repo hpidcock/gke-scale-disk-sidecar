@@ -7,6 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,8 +17,9 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/oauth2/google"
-	compute "google.golang.org/api/compute/v1"
+	multierror "github.com/hashicorp/go-multierror"
+	google_oauth "golang.org/x/oauth2/google"
+	google_compute "google.golang.org/api/compute/v1"
 
 	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,20 +28,18 @@ import (
 )
 
 var (
-	projectID     = flag.String("project-id", "", "name of the GCP project the node-pool is running in")
-	containerName = flag.String("container-name", "", "name of this k8s container")
-	podName       = flag.String("pod-name", "", "name of the parent k8s pod")
-	namespace     = flag.String("namespace", "", "name of the parent k8s namespace")
-	volumesString = flag.String("volumes", "", "comma seperated list of mounted volumes to expand")
-	threshold     = flag.Int("threshold", 80, "usage percentage threshold on a volume to trigger expansion")
-	expandBy      = flag.Int("expand-by", 20, "percentage of current volume size to add when expansion is triggered")
-	pollPeriod    = flag.Duration("poll-period", 60*time.Second, "period between each poll of disk status")
-)
+	projectID     string
+	namespace     string
+	containerName string
+	podName       string
+	volumeString  string
+	threshold     int
+	expandBy      int
+	pollPeriod    time.Duration
 
-var (
-	computeService        *compute.Service
-	diskService           *compute.DisksService
-	zoneOperationsService *compute.ZoneOperationsService
+	computeService        *google_compute.Service
+	diskService           *google_compute.DisksService
+	zoneOperationsService *google_compute.ZoneOperationsService
 )
 
 type mountedGCEVolume struct {
@@ -53,35 +54,36 @@ type mountedGCEVolume struct {
 func main() {
 	ctx := context.Background()
 
+	flag.StringVar(&containerName, "container-name", "", "name of this k8s container")
+	flag.StringVar(&podName, "pod-name", "", "name of the parent k8s pod")
+	flag.StringVar(&namespace, "namespace", "", "name of the parent k8s namespace")
+	flag.StringVar(&volumeString, "volumes", "", "comma seperated list of mounted volumes to expand")
+	flag.IntVar(&threshold, "threshold", 80, "usage percentage threshold on a volume to trigger expansion")
+	flag.IntVar(&expandBy, "expand-by", 20, "percentage of current volume size to add when expansion is triggered")
+	flag.DurationVar(&pollPeriod, "poll-period", 60*time.Second, "period between each poll of disk status")
+
 	flag.Parse()
 	if flag.Parsed() == false ||
-		*containerName == "" ||
-		*podName == "" ||
-		*namespace == "" ||
-		*volumesString == "" ||
-		*projectID == "" {
+		containerName == "" ||
+		podName == "" ||
+		namespace == "" ||
+		volumeString == "" {
 		flag.PrintDefaults()
 		return
 	}
 
-	volumes := strings.Split(*volumesString, ",")
+	volumes := strings.Split(volumeString, ",")
 
-	client, err := google.DefaultClient(ctx, compute.ComputeScope)
+	client, err := google_oauth.DefaultClient(ctx, google_compute.ComputeScope)
 	if err != nil {
 		log.Fatal(err)
 	}
-	computeService, err = compute.New(client)
+	computeService, err = google_compute.New(client)
 	if err != nil {
 		log.Fatal(err)
 	}
-	diskService, err = compute.NewDisksService(computeService)
-	if err != nil {
-		log.Fatal(err)
-	}
-	zoneOperationsService, err = compute.NewZoneOperationsService(computeService)
-	if err != nil {
-		log.Fatal(err)
-	}
+	diskService = google_compute.NewDisksService(computeService)
+	zoneOperationsService = google_compute.NewZoneOperationsService(computeService)
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -93,7 +95,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	pod, err := clientset.Core().Pods(*namespace).Get(*podName, meta_v1.GetOptions{})
+	pod, err := clientset.Core().Pods(namespace).Get(podName, meta_v1.GetOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -102,7 +104,28 @@ func main() {
 		log.Fatal("could not find pod")
 	}
 
-	container, err := findContainer(pod, *containerName)
+	node, err := clientset.Core().Nodes().Get(pod.Spec.NodeName, meta_v1.GetOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if node == nil {
+		log.Fatal("could not find pod's node")
+	}
+
+	uri, err := url.Parse(node.Spec.ProviderID)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if uri.Scheme != "gcp" {
+		log.Fatal("pod running on a non-GKE node")
+	}
+
+	projectID = uri.Host
+	log.Printf("GCP ProjectID is %s", projectID)
+
+	container, err := findContainer(pod, containerName)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -123,7 +146,7 @@ func main() {
 				log.Printf("volume %s: %v", volume.Name, err) // Non-fatal, try again next loop
 			}
 		}
-		time.Sleep(*pollPeriod)
+		time.Sleep(pollPeriod)
 	}
 }
 
@@ -133,11 +156,11 @@ func checkFilesystemUsage(volume mountedGCEVolume) error {
 		return err
 	}
 
-	if usage < *threshold {
+	if usage < threshold {
 		return nil
 	}
 
-	log.Printf("volume %s has passed pressure threshold of %d%% usage", volume.Name, *threshold)
+	log.Printf("volume %s has passed pressure threshold of %d%% usage", volume.Name, threshold)
 	log.Printf("volume %s: attempting to resize filesystem to partition size", volume.Name)
 
 	err = resizeFilesystem(volume)
@@ -150,12 +173,12 @@ func checkFilesystemUsage(volume mountedGCEVolume) error {
 		return err
 	}
 
-	if usage < *threshold {
+	if usage < threshold {
 		log.Printf("volume %s: filesystem resized to partition succesfully relieved pressure", volume.Name)
 		return nil
 	}
 
-	log.Printf("volume %s: attempting to resize persistent disk to %d%%", volume.Name, 100+*expandBy)
+	log.Printf("volume %s: attempting to resize persistent disk to %d%%", volume.Name, 100+expandBy)
 	err = resizePersistentDisk(volume)
 	if err != nil {
 		return err
@@ -174,7 +197,7 @@ func checkFilesystemUsage(volume mountedGCEVolume) error {
 		return err
 	}
 
-	if usage < *threshold {
+	if usage < threshold {
 		log.Printf("volume %s: persistent disk resized, filesystem resized to partition, succesfully relieved pressure", volume.Name)
 		return nil
 	}
@@ -183,7 +206,58 @@ func checkFilesystemUsage(volume mountedGCEVolume) error {
 }
 
 func resizePersistentDisk(volume mountedGCEVolume) error {
+	log.Printf("DisksService: attempting to get PD %s in zone %s project %s", volume.PDName, volume.GCPZone, projectID)
+	disk, err := diskService.Get(projectID, volume.GCPZone, volume.PDName).Do()
+	if err != nil {
+		return err
+	}
 
+	log.Printf("DisksService: PD %s is %dGb in size", volume.PDName, disk.SizeGb)
+
+	// Grow by at least 1GB
+	expand := math.Max(1, float64(disk.SizeGb)*(float64(expandBy)/100.0))
+	newSize := disk.SizeGb + int64(math.Ceil(expand))
+
+	log.Printf("DisksService: attempting to resize PD %s from %dGb to %dGb", volume.PDName, disk.SizeGb, newSize)
+
+	resizeReq := google_compute.DisksResizeRequest{
+		SizeGb: newSize,
+	}
+	op, err := diskService.Resize(projectID, volume.GCPZone, volume.PDName, &resizeReq).Do()
+	if err != nil {
+		return err
+	}
+
+	if op == nil {
+		return fmt.Errorf("nil operation returned by GCPDisksService")
+	}
+
+	for op.Status != "DONE" || op.Error != nil {
+		op, err = zoneOperationsService.Get(projectID, volume.GCPZone, op.Name).Do()
+		if err != nil {
+			return err
+		}
+
+		if op == nil {
+			return fmt.Errorf("nil operation returned by GCPZoneOperationsService")
+		}
+	}
+
+	if op.Error != nil {
+		merr := &multierror.Error{}
+		for _, v := range op.Error.Errors {
+			if v == nil {
+				continue
+			}
+
+			merr = multierror.Append(merr, errors.New(v.Message))
+		}
+
+		return multierror.Flatten(merr)
+	}
+
+	log.Printf("DisksService: PD %s resized", volume.PDName)
+	return nil
 }
 
 func resizeFilesystem(volume mountedGCEVolume) error {
@@ -239,11 +313,11 @@ func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes [
 	for _, volumeName := range volumes {
 		volume, ok := mappedVolumes[volumeName]
 		if ok == false {
-			return nil, fmt.Errorf("volume %s does not exist in pod %s", volumeName, *podName)
+			return nil, fmt.Errorf("volume %s does not exist in pod %s", volumeName, podName)
 		}
 		volumeMount, ok := mappedVolumeMounts[volumeName]
 		if ok == false {
-			return nil, fmt.Errorf("volume %s is not mounted to container %s", volumeName, *containerName)
+			return nil, fmt.Errorf("volume %s is not mounted to container %s", volumeName, containerName)
 		}
 
 		if volume.GCEPersistentDisk != nil {
@@ -256,14 +330,14 @@ func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes [
 
 		pvcName := volume.PersistentVolumeClaim.ClaimName
 		pvc, err := clientset.Core().
-			PersistentVolumeClaims(*namespace).
+			PersistentVolumeClaims(namespace).
 			Get(pvcName, meta_v1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
 
 		if pvc == nil {
-			return nil, fmt.Errorf("could not find PersistentVolumeClaim %s in namespace %s", pvcName, *namespace)
+			return nil, fmt.Errorf("could not find PersistentVolumeClaim %s in namespace %s", pvcName, namespace)
 		}
 
 		if pvc.Status.Phase != core_v1.ClaimBound {
@@ -281,25 +355,38 @@ func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes [
 		}
 
 		if pv.Status.Phase != core_v1.VolumeBound {
-			return nil, fmt.Errorf("PersistentVolume %s phase is not Bound, instead %s", pvName, pv.Status.Phase)
+			return nil, fmt.Errorf("volume %s: PV %s phase is not Bound, instead %s", volumeName, pvName, pv.Status.Phase)
 		}
 
 		pd := pv.Spec.GCEPersistentDisk
-
 		if pd == nil {
-			return nil, fmt.Errorf("volume %s is not a GCEPersistentDisk", volumeName)
+			return nil, fmt.Errorf("volume %s: PV %s is not a GCEPersistentDisk", volumeName, pvName)
+		}
+
+		if pv.Labels == nil {
+			return nil, fmt.Errorf("volume %s: PV %s is missing labels", volumeName, pvName)
+		}
+
+		regionLabel, ok := pv.Labels["failure-domain.beta.kubernetes.io/region"]
+		if ok == false {
+			return nil, fmt.Errorf("volume %s: PV %s missing failure-domain.beta.kubernetes.io/region label", volumeName, pvName)
+		}
+
+		zoneLabel, ok := pv.Labels["failure-domain.beta.kubernetes.io/zone"]
+		if ok == false {
+			return nil, fmt.Errorf("volume %s: PV %s missing failure-domain.beta.kubernetes.io/zone label", volumeName, pvName)
 		}
 
 		if pd.Partition != 0 {
-			return nil, fmt.Errorf("volume %s has more than one parition", volumeName)
+			return nil, fmt.Errorf("volume %s: PD %s has more than one parition", volumeName, pd.PDName)
 		}
 
 		if pd.ReadOnly == true {
-			return nil, fmt.Errorf("volume %s is read only", volumeName)
+			return nil, fmt.Errorf("volume %s: PD %s is read only", volumeName, pd.PDName)
 		}
 
 		if pd.FSType != "" && pd.FSType != "ext4" {
-			return nil, fmt.Errorf("volume %s is not a ext4 volume", volumeName)
+			return nil, fmt.Errorf("volume %s: PD %s is not a ext4 volume", volumeName, pd.PDName)
 		}
 
 		devicePath, err := resolveDevicePath(volumeMount.MountPath)
@@ -316,6 +403,8 @@ func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes [
 			MountedPath: volumeMount.MountPath,
 			DevicePath:  devicePath,
 			PDName:      pd.PDName,
+			GCPRegion:   regionLabel,
+			GCPZone:     zoneLabel,
 		})
 	}
 
