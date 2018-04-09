@@ -11,7 +11,7 @@ ADD main.go .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o gke-scale-disk-sidecar .
 
 FROM alpine
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates findmnt e2fsprogs-extra
 WORKDIR /root/
 COPY --from=build /go/src/github.com/hpidcock/gke-scale-disk-sidecar/gke-scale-disk-sidecar .
 ENTRYPOINT [ "/root/gke-scale-disk-sidecar" ]

@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -103,6 +102,7 @@ func main() {
 	if pod == nil {
 		log.Fatal("could not find pod")
 	}
+	log.Printf("found pod %s", pod.Name)
 
 	node, err := clientset.Core().Nodes().Get(pod.Spec.NodeName, meta_v1.GetOptions{})
 	if err != nil {
@@ -112,6 +112,7 @@ func main() {
 	if node == nil {
 		log.Fatal("could not find pod's node")
 	}
+	log.Printf("found node %s", node.Name)
 
 	uri, err := url.Parse(node.Spec.ProviderID)
 	if err != nil {
@@ -129,6 +130,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	log.Printf("found container %s", container.Name)
 
 	gceVolumes, err := getMountedVolumes(pod, container, volumes, clientset)
 	if err != nil {
@@ -288,23 +291,6 @@ func getFilesystemUsage(volume mountedGCEVolume) (int, error) {
 
 	usage := int((1.0 - (float64(stat.Bavail) / float64(stat.Blocks))) * 100.0)
 	return usage, nil
-}
-
-func getSizeOfBlockDevice(devicePath string) (int64, error) {
-	cmd := exec.Command("blockdev", "--getsize64", devicePath)
-	if cmd == nil {
-		return 0, fmt.Errorf("could not start blockdev")
-	}
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-
-	err := cmd.Run()
-	if err != nil {
-		return 0, err
-	}
-
-	return strconv.ParseInt(out.String(), 10, 64)
 }
 
 func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes []string, clientset *kubernetes.Clientset) ([]mountedGCEVolume, error) {
