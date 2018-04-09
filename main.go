@@ -138,10 +138,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if len(gceVolumes) != len(volumes) {
+		log.Fatal("was not able to map all volumes")
+	}
+
 	for _, volume := range gceVolumes {
 		log.Printf("volume %s: GCE PD %s attached as %s mounted to %s", volume.Name, volume.PDName, volume.DevicePath, volume.MountedPath)
 	}
 
+	log.Print("starting volume monitor loop")
 	for {
 		for _, volume := range gceVolumes {
 			err := checkFilesystemUsage(volume)
@@ -317,6 +322,7 @@ func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes [
 		}
 
 		pvcName := volume.PersistentVolumeClaim.ClaimName
+		log.Printf("attempting to get PersistentVolumeClaim %s", pvcName)
 		pvc, err := clientset.Core().
 			PersistentVolumeClaims(namespace).
 			Get(pvcName, meta_v1.GetOptions{})
@@ -333,6 +339,7 @@ func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes [
 		}
 
 		pvName := pvc.Spec.VolumeName
+		log.Printf("attempting to get PersistentVolume %s", pvName)
 		pv, err := clientset.Core().PersistentVolumes().Get(pvName, meta_v1.GetOptions{})
 		if err != nil {
 			return nil, err
@@ -377,6 +384,7 @@ func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes [
 			return nil, fmt.Errorf("volume %s: PD %s is not a ext4 volume", volumeName, pd.PDName)
 		}
 
+		log.Printf("attempting to resolve device path for %s", volumeMount.MountPath)
 		devicePath, err := resolveDevicePath(volumeMount.MountPath)
 		if err != nil {
 			return nil, nil
