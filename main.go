@@ -9,7 +9,6 @@ import (
 	"log"
 	"math"
 	"net/url"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -299,7 +298,7 @@ func getFilesystemUsage(volume mountedGCEVolume) (int, error) {
 }
 
 func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes []string, clientset *kubernetes.Clientset) ([]mountedGCEVolume, error) {
-	gceVolumes := make([]mountedGCEVolume, len(volumes))
+	gceVolumes := make([]mountedGCEVolume, 0)
 
 	mappedVolumeMounts := mapVolumeMounts(container.VolumeMounts)
 	mappedVolumes := mapVolumes(pod.Spec.Volumes)
@@ -387,7 +386,7 @@ func getMountedVolumes(pod *core_v1.Pod, container *core_v1.Container, volumes [
 		log.Printf("attempting to resolve device path for %s", volumeMount.MountPath)
 		devicePath, err := resolveDevicePath(volumeMount.MountPath)
 		if err != nil {
-			return nil, nil
+			return nil, err
 		}
 
 		if devicePath == "" {
@@ -421,12 +420,8 @@ func resolveDevicePath(mountPath string) (string, error) {
 		return "", err
 	}
 
-	path := filepath.Clean(out.String())
-	if _, err = os.Stat(path); os.IsNotExist(err) {
-		return "", fmt.Errorf("mount target %s yielded no existent device %s", mountPath, path)
-	}
-
-	return path, nil
+	path := strings.Trim(out.String(), " \n\r\t")
+	return filepath.Clean(path), nil
 }
 
 func mapVolumeMounts(volumeMounts []core_v1.VolumeMount) map[string]core_v1.VolumeMount {
